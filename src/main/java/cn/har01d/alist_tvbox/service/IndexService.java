@@ -25,11 +25,12 @@ import cn.har01d.alist_tvbox.util.TextUtils;
 import cn.har01d.alist_tvbox.util.Utils;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.env.Environment;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpEntity;
@@ -58,6 +59,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalTime;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashMap;
@@ -67,6 +69,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
@@ -93,6 +96,7 @@ public class IndexService {
     private final TaskService taskService;
     private final AListLocalService aListLocalService;
     private final TmdbService tmdbService;
+    private final GitHubProxyService gitHubProxyService;
     private final AppProperties appProperties;
     private final SettingRepository settingRepository;
     private final IndexTemplateRepository indexTemplateRepository;
@@ -107,6 +111,7 @@ public class IndexService {
                         TaskService taskService,
                         AListLocalService aListLocalService,
                         TmdbService tmdbService,
+                        GitHubProxyService gitHubProxyService,
                         AppProperties appProperties,
                         SettingRepository settingRepository,
                         IndexTemplateRepository indexTemplateRepository,
@@ -119,6 +124,7 @@ public class IndexService {
         this.taskService = taskService;
         this.aListLocalService = aListLocalService;
         this.tmdbService = tmdbService;
+        this.gitHubProxyService = gitHubProxyService;
         this.appProperties = appProperties;
         this.settingRepository = settingRepository;
         this.indexTemplateRepository = indexTemplateRepository;
@@ -126,6 +132,8 @@ public class IndexService {
         this.restTemplate = builder
                 .defaultHeader(HttpHeaders.ACCEPT, Constants.ACCEPT)
                 .defaultHeader(HttpHeaders.USER_AGENT, Constants.USER_AGENT1)
+                .connectTimeout(Duration.ofSeconds(10))
+                .readTimeout(Duration.ofSeconds(60))
                 .build();
         this.objectMapper = objectMapper;
         this.environment = environment;
@@ -187,7 +195,6 @@ public class IndexService {
         }
     }
 
-    @Scheduled(cron = "0 0 22 * * ?")
     public void update() {
         getRemoteVersion();
     }
@@ -214,18 +221,57 @@ public class IndexService {
     private String getVersion() {
         String remote;
         try {
-            remote = restTemplate.getForObject("http://docker.xiaoya.pro/version.txt", String.class);
+            remote = getGitHubVersion("https://raw.githubusercontent.com/xiaoyaliu00/data/main/version.txt");
         } catch (ResourceAccessException e) {
             remote = restTemplate.getForObject("https://d.har01d.cn/version.txt", String.class);
         }
         return Utils.trim(remote);
     }
 
+    private String getGitHubVersion(String url) {
+        for (String candidate : getVersionUrls(url)) {
+            try {
+                String text = restTemplate.getForObject(candidate, String.class);
+                if (text == null) {
+                    continue;
+                }
+                text = text.trim();
+                log.debug("get index version: {}", text);
+                return text;
+            } catch (Exception e) {
+                log.warn("load index version failed from {}", candidate, e);
+            }
+        }
+        return "";
+    }
+
+    private List<String> getVersionUrls(String url) {
+        List<String> urls = new ArrayList<>();
+        for (String proxy : gitHubProxyService.readProxyListFromFile()) {
+            if (proxy == null || proxy.trim().isEmpty()) {
+                urls.add(url);
+            } else {
+                urls.add(proxy + url);
+            }
+        }
+        if (!urls.contains(url)) {
+            urls.add(url);
+        }
+        return urls;
+    }
+
     public void updateXiaoyaIndexFile(String remote) {
         try {
             log.info("download xiaoya index file");
             ProcessBuilder builder = new ProcessBuilder();
-            builder.command("sh", "-c", "/index.sh", remote);
+            // Execute script directly without shell wrapper to prevent command injection
+            // Validate remote parameter to ensure it doesn't contain malicious commands
+            if (remote != null && (remote.contains(";") || remote.contains("|") || remote.contains("&") ||
+                                   remote.contains("`") || remote.contains("$") || remote.contains("\n"))) {
+                log.error("Invalid remote parameter contains shell metacharacters: {}", remote);
+                throw new IllegalArgumentException("Invalid remote parameter");
+            }
+            builder.command("bash", "/index.sh", remote);
             builder.inheritIO();
             builder.directory(new File("/tmp"));
             Process process = builder.start();
@@ -288,7 +334,7 @@ public class IndexService {
             downloadZipFile(site, url, name);
         } else {
             log.info("download index file from {}", url);
-            FileUtils.copyURLToFile(new URL(url), file);
+            FileUtils.copyURLToFile(new URL(url), file, 10_000, 60_000);
         }
 
         return file.getAbsolutePath();
@@ -316,8 +362,12 @@ public class IndexService {
     private static String getRemoteTime(Site site, String url) {
         try {
             File file = Files.createTempFile(String.valueOf(site.getId()), ".info").toFile();
-            FileUtils.copyURLToFile(new URL(url), file);
-            return FileUtils.readFileToString(file, StandardCharsets.UTF_8);
+            try {
+                FileUtils.copyURLToFile(new URL(url), file, 10_000, 60_000);
+                return FileUtils.readFileToString(file, StandardCharsets.UTF_8);
+            } finally {
+                Files.deleteIfExists(file.toPath());
+            }
         } catch (Exception e) {
             // ignore
         }
@@ -326,7 +376,7 @@ public class IndexService {
 
     private static void downloadZipFile(Site site, String url, String name) throws IOException {
         File zipFile = new File(".cache/" + site.getId() + "/" + name);
-        FileUtils.copyURLToFile(new URL(url), zipFile);
+        FileUtils.copyURLToFile(new URL(url), zipFile, 10_000, 60_000);
         unzip(zipFile);
         Files.delete(zipFile.toPath());
     }
@@ -338,16 +388,30 @@ public class IndexService {
             Enumeration<? extends ZipEntry> entries = zipFile.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
-                Path entryPath = destFolderPath.resolve(entry.getName());
-                if (entryPath.normalize().startsWith(destFolderPath.normalize())) {
-                    if (entry.isDirectory()) {
-                        Files.createDirectories(entryPath);
-                    } else {
-                        Files.createDirectories(entryPath.getParent());
-                        try (InputStream in = zipFile.getInputStream(entry);
-                             OutputStream out = Files.newOutputStream(entryPath.toFile().toPath())) {
-                            IOUtils.copy(in, out);
-                        }
+                String entryName = entry.getName();
+
+                // Validate entry name before resolving to prevent Zip Slip
+                if (entryName.contains("..") || entryName.startsWith("/") ||
+                    entryName.contains("\\") || entryName.startsWith("\\")) {
+                    log.warn("Blocked suspicious zip entry: {}", entryName);
+                    throw new IOException("Invalid zip entry path: " + entryName);
+                }
+
+                Path entryPath = destFolderPath.resolve(entryName);
+
+                // Additional check: ensure resolved path is still within destination
+                if (!entryPath.normalize().startsWith(destFolderPath.normalize())) {
+                    log.warn("Zip entry escapes destination directory: {}", entryName);
+                    throw new IOException("Zip entry attempts path traversal: " + entryName);
+                }
+
+                if (entry.isDirectory()) {
+                    Files.createDirectories(entryPath);
+                } else {
+                    Files.createDirectories(entryPath.getParent());
+                    try (InputStream in = zipFile.getInputStream(entry);
+                         OutputStream out = Files.newOutputStream(entryPath.toFile().toPath())) {
+                        IOUtils.copy(in, out);
                     }
                 }
             }
@@ -375,7 +439,7 @@ public class IndexService {
         List<IndexTemplate> list = indexTemplateRepository.findByScheduledTrue();
         log.debug("auto index: {}", list.size());
         for (IndexTemplate template : list) {
-            if (template.getScheduleTime() != null && template.getScheduleTime().contains(hour)) {
+            if (template.getScheduleTime() != null && Arrays.asList(template.getScheduleTime().split("\\|")).contains(hour)) {
                 try {
                     log.info("auto index for template: {}", template.getId());
                     IndexRequest indexRequest = objectMapper.readValue(template.getData(), IndexRequest.class);
@@ -447,14 +511,18 @@ public class IndexService {
                 context.getTime().clear();
                 path = customize(context, indexRequest, path);
                 stopWatch.start("index " + path);
-                var shareInfo = getShareInfo(site, path);
-                if (shareInfo != null) {
-                    index(context, shareInfo, shareInfo.getFileId(), path, 0);
-                } else {
-                    index(context, path, 0);
+                try {
+                    var shareInfo = getShareInfo(site, path);
+                    if (shareInfo != null) {
+                        index(context, shareInfo, shareInfo.getFileId(), path, 0);
+                    } else {
+                        index(context, path, 0);
+                    }
+                    handleUpdateTime(path, context.getTime());
+                } finally {
+                    // 路径异常跳出若不 stop,下一轮 start 抛 IllegalStateException 掩盖原始异常
+                    stopWatch.stop();
                 }
-                handleUpdateTime(path, context.getTime());
-                stopWatch.stop();
                 log.info("{} {}", path, context.stats.indexed - total);
                 total = context.stats.indexed;
             }
@@ -998,6 +1066,25 @@ public class IndexService {
             return URLDecoder.decode(url, StandardCharsets.UTF_8);
         } catch (Exception e) {
             return url;
+        }
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        log.info("Shutting down IndexService executor");
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                log.warn("Executor did not terminate in time, forcing shutdown");
+                executor.shutdownNow();
+                if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    log.error("Executor did not terminate after forced shutdown");
+                }
+            }
+        } catch (InterruptedException e) {
+            log.warn("Interrupted while waiting for executor to terminate", e);
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 }

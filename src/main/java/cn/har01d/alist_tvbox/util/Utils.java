@@ -14,6 +14,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import java.io.BufferedReader;
@@ -23,18 +25,24 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLEncoder;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.StringJoiner;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -71,7 +79,9 @@ public final class Utils {
         try {
             var resource = new ClassPathResource("ua.txt");
             String lines = resource.getContentAsString(StandardCharsets.UTF_8);
-            userAgents.addAll(Arrays.asList(lines.split("\n")));
+            // 文件可能是 CRLF 行尾,残留 \r 会进 UA 头
+            userAgents.addAll(Arrays.asList(lines.replace("\r", "").split("\n")));
+            userAgents.removeIf(String::isBlank);
             log.info("Read {} user agents", userAgents.size());
         } catch (IOException e) {
             log.warn("read user agents failed: ", e);
@@ -155,7 +165,7 @@ public final class Utils {
     public static String md5(String input) {
         try {
             MessageDigest md = MessageDigest.getInstance("MD5");
-            md.update(input.getBytes());
+            md.update(input.getBytes(StandardCharsets.UTF_8));
             byte[] digest = md.digest();
             return DatatypeConverter.printHexBinary(digest).toLowerCase();
         } catch (Exception e) {
@@ -175,6 +185,32 @@ public final class Utils {
         }
     }
 
+    /**
+     * 将可能含非 ASCII 字符(如中文)的 URL 或相对路径转换为严格 ASCII 形式。
+     * 仅对非 ASCII 字节做百分号编码,保留所有 ASCII 字符(含 /、?、#、&、= 及已存在的 %XX 转义)原样不变,
+     * 因此对已编码输入幂等、不会二次编码;也不改变 ASCII 结构,故对纯 ASCII 输入直接返回。
+     * 用于在构造 java.net.URI 之前规范化用户可控 URL(如插件仓库/文件地址),避免 URISyntaxException。
+     */
+    public static String toAsciiUrl(String url) {
+        if (StringUtils.isBlank(url)) {
+            return url;
+        }
+        String s = url.trim();
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        StringBuilder sb = new StringBuilder(bytes.length);
+        for (byte b : bytes) {
+            int v = b & 0xFF;
+            if (v < 0x80) {
+                sb.append((char) v);
+            } else {
+                sb.append('%')
+                        .append(Character.toUpperCase(Character.forDigit(v >>> 4, 16)))
+                        .append(Character.toUpperCase(Character.forDigit(v & 0xF, 16)));
+            }
+        }
+        return sb.toString();
+    }
+
     public static String encryptWbi(Map<String, Object> params, String imgKey, String subKey) {
         String mixinKey = getMixinKey(imgKey, subKey);
         params.put("wts", System.currentTimeMillis() / 1000);
@@ -187,7 +223,45 @@ public final class Utils {
         return param.toString().replace("%2C", ",") + "&w_rid=" + wbiSign;
     }
 
+    /**
+     * WBI 签名(RFC3986 严格编码版):参数值按 encodeURIComponent 语义百分号编码(大写十六进制、空格 %20)。
+     * 官方规则(docs/misc/sign/wbi.md)即此行为;encryptWbi 的宽松编码只对非 ASCII 生效,
+     * 值含 JSON(如评论 pagination_str 的 {"offset":..})时签名串与官方不一致,上游回 -403 访问权限不足。
+     * 已验证可用的旧接口(dm_img_inter 等)不动,继续走 encryptWbi。
+     */
+    public static String encryptWbiRfc3986(Map<String, Object> params, String imgKey, String subKey) {
+        String mixinKey = getMixinKey(imgKey, subKey);
+        params.put("wts", System.currentTimeMillis() / 1000);
+        StringJoiner param = new StringJoiner("&");
+        params.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(entry -> param.add(entry.getKey() + "=" + rfc3986Encode(entry.getValue().toString())));
+        String s = param + mixinKey;
+        String wbiSign = md5(s);
+        return param + "&w_rid=" + wbiSign;
+    }
+
+    private static String rfc3986Encode(String value) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : value.getBytes(StandardCharsets.UTF_8)) {
+            int v = b & 0xFF;
+            char c = (char) v;
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                    || "-_.~!'()*".indexOf(c) >= 0) {
+                sb.append(c);
+            } else {
+                sb.append('%')
+                        .append(Character.toUpperCase(Character.forDigit(v >>> 4, 16)))
+                        .append(Character.toUpperCase(Character.forDigit(v & 0xF, 16)));
+            }
+        }
+        return sb.toString();
+    }
+
     public static String byte2size(long size) {
+        if (size <= 0) {
+            return "";
+        }
         String result;
         String unit = "B";
         if (size > 999 * MB) {
@@ -211,6 +285,81 @@ public final class Utils {
         return result + " " + unit;
     }
 
+    /**
+     * 校验外部 URL 是否安全(仅允许 http/https,拦截 loopback/链路本地/云元数据)。
+     * 用于服务端按用户可控 URL 发起请求前的 SSRF 防护。私网段(10/192.168/172.16)不拦截,
+     * 以兼容内网 NAS/emby 封面代理场景。
+     */
+    public static boolean isSafeExternalUrl(String url) {
+        try {
+            URI uri = new URI(url);
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if (scheme == null || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))) {
+                log.warn("Blocked non-HTTP(S) URL: {}", url);
+                return false;
+            }
+            if (host == null || host.isEmpty()) {
+                log.warn("Blocked URL with no host: {}", url);
+                return false;
+            }
+            // URI.getHost() 对 IPv6 literal 返回带方括号(如 [::1]),去掉方括号再判断
+            if (host.startsWith("[") && host.endsWith("]")) {
+                host = host.substring(1, host.length() - 1);
+            }
+            host = host.toLowerCase();
+            if (host.equals("localhost") || host.startsWith("127.") || host.equals("0.0.0.0")
+                    || host.equals("::1") || host.equals("0:0:0:0:0:0:0:1")) {
+                log.warn("Blocked localhost/loopback URL: {}", url);
+                return false;
+            }
+            if (host.startsWith("169.254.") || host.equals("metadata.google.internal") || host.equals("169.254.169.254")) {
+                log.warn("Blocked link-local/metadata URL: {}", url);
+                return false;
+            }
+            // 解析为 InetAddress,拦截所有 loopback/link-local/wildcard/私网(site-local 10.x/172.16-31/192.168.x,
+            // 含 Docker 网段与宿主网关)变体 —— 未认证图片/字幕代理可回读内网 HTTP 全文,必须连私网一起拦
+            try {
+                InetAddress addr = InetAddress.getByName(host);
+                if (addr.isLoopbackAddress() || addr.isLinkLocalAddress() || addr.isAnyLocalAddress()
+                        || addr.isSiteLocalAddress() || addr.isMulticastAddress()) {
+                    log.warn("Blocked loopback/link-local/private/multicast IP: {} -> {}", url, addr.getHostAddress());
+                    return false;
+                }
+            } catch (UnknownHostException e) {
+                // 无法解析即拒绝:此前放行 + 二次解析存在 DNS rebinding 窗口,域名可被解析到私网
+                log.warn("Blocked unresolvable host: {}", url);
+                return false;
+            }
+            return true;
+        } catch (URISyntaxException e) {
+            log.warn("Invalid URL syntax: {}", url, e);
+            return false;
+        }
+    }
+
+    /** 校验路径段(文件名/站点id/索引名)不含目录穿越字符;非法则抛 BadRequestException。 */
+    public static String requireSafePathSegment(String segment) {
+        if (segment == null || segment.isEmpty()
+                || segment.contains("..") || segment.contains("/") || segment.contains("\\")
+                || segment.contains(File.separator)) {
+            throw new BadRequestException("非法路径: " + segment);
+        }
+        return segment;
+    }
+
+    /** 脱敏:保留首尾各 2 字符,中间以 **** 替代。用于日志中的 token/cookie/apiKey。 */
+    public static String mask(String s) {
+        if (s == null) {
+            return "";
+        }
+        int len = s.length();
+        if (len <= 8) {
+            return "****";
+        }
+        return s.substring(0, 2) + "****" + s.substring(len - 2);
+    }
+
     public static int executeUpdate(String sql) {
         int code = 1;
         try {
@@ -231,16 +380,25 @@ public final class Utils {
         try {
             ProcessBuilder builder = new ProcessBuilder();
             builder.command("sqlite3", Utils.getAListPath("data/data.db"), sql);
+            // stderr 丢弃 + 限时等待:只排 stdout 时 stderr 撑满管道缓冲会互相死锁,waitFor 无限等同样可挂死
+            builder.redirectError(ProcessBuilder.Redirect.DISCARD);
             Process process = builder.start();
-            BufferedReader reader =
-                    new BufferedReader(new InputStreamReader(process.getInputStream()));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line);
-                sb.append(System.getProperty("line.separator"));
+            String output;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line);
+                    sb.append(System.getProperty("line.separator"));
+                }
+                output = sb.toString().trim();
             }
-            return sb.toString().trim();
+            if (!process.waitFor(30, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                log.warn("sqlite3 query timeout: {}", sql);
+                return "";
+            }
+            return output;
         } catch (Exception e) {
             log.warn("", e);
         }
@@ -404,7 +562,41 @@ public final class Utils {
         }
     }
 
+    /** 信任的反代地址(精确 IP 或 192.168./* 前缀):remoteAddr 命中时才采信 XFF 等转发头。
+     *  默认空 = 放行(兼容大量反代部署用户:默认不信会让所有用户共享限速桶、日志只见反代 IP);
+     *  需要收口时显式配置 trusted_proxies,配置后仅列表内地址的转发头被采信,其余一律用 TCP 对端地址。 */
+    private static volatile Set<String> trustedProxies = Set.of();
+
+    public static void setTrustedProxies(Set<String> proxies) {
+        trustedProxies = proxies == null ? Set.of() : proxies;
+    }
+
+    private static boolean isTrustedProxy(String ip) {
+        if (trustedProxies.isEmpty()) {
+            // 未配置信任列表:维持历来行为,采信转发头
+            return true;
+        }
+        if (ip == null) {
+            return false;
+        }
+        for (String entry : trustedProxies) {
+            if (entry.equals(ip)) {
+                return true;
+            }
+            if (entry.endsWith("/*") && ip.startsWith(entry.substring(0, entry.length() - 1))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static String getClientIp(HttpServletRequest request) {
+        String remote = request.getRemoteAddr();
+        if (!isTrustedProxy(remote)) {
+            // 直连或未配置信任反代:X-Forwarded-For 等头全部可伪造,一律以 TCP 对端地址为准
+            return remote;
+        }
+
         String ip = request.getHeader("X-Forwarded-For");
 
         if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
@@ -420,7 +612,7 @@ public final class Utils {
             ip = request.getHeader("HTTP_X_FORWARDED_FOR");
         }
         if (ip == null || ip.isEmpty() || "unknown".equalsIgnoreCase(ip)) {
-            ip = request.getRemoteAddr();
+            ip = remote;
         }
 
         // In case of multiple IPs (comma-separated), take the first one
@@ -429,6 +621,46 @@ public final class Utils {
         }
 
         return ip;
+    }
+
+    /**
+     * 信任来源(反代)的 X-Forwarded-Proto 首段:Caddy/nginx 等做 TLS 终结时后端只能看到 http 连接,
+     * 客户端实际协议只能从这个头还原。取值与 getClientIp 共用 trusted_proxies 信任模型
+     * (未配置=维持历来行为采信转发头)。多级反代逗号链取最左(客户端到第一跳的真实协议)。
+     * 非信任来源或缺失/空白返回 null,由调用方回落自身默认。
+     */
+    public static String getTrustedForwardedProto(HttpServletRequest request) {
+        if (request == null || !isTrustedProxy(request.getRemoteAddr())) {
+            return null;
+        }
+        String proto = request.getHeader("X-Forwarded-Proto");
+        if (StringUtils.isBlank(proto)) {
+            return null;
+        }
+        int comma = proto.indexOf(',');
+        String value = (comma > 0 ? proto.substring(0, comma) : proto).trim().toLowerCase();
+        // 只认 http/https:h2/h2c 等中间协议不是可用链接协议,按缺失回落
+        return "http".equals(value) || "https".equals(value) ? value : null;
+    }
+
+    /**
+     * 生成客户端可访问链接应使用的协议(#1073):反代 TLS 终结时采信信任来源的
+     * X-Forwarded-Proto,与用户实际访问协议一致;无该头(直连/反代未终结 TLS)时
+     * 回落既有 enable_https 全局开关语义(192.168. 内网直连恒 http)。
+     */
+    public static String publicScheme(boolean enableHttps) {
+        String forwardedProto = getTrustedForwardedProto(currentRequestOrNull());
+        if (forwardedProto != null) {
+            return forwardedProto;
+        }
+        return enableHttps && !isLocalAddress() ? "https" : "http";
+    }
+
+    private static HttpServletRequest currentRequestOrNull() {
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes) {
+            return attributes.getRequest();
+        }
+        return null;
     }
 
     public static String getQrCode(String text) throws IOException {

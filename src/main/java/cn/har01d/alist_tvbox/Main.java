@@ -18,14 +18,11 @@ import java.util.stream.Collectors;
 
 public class Main {
     private static final List<String> CUSTOM_REFLECTION_CLASSES = List.of(
-            "com.github.benmanes.caffeine.cache.SSMS",
-            "com.github.benmanes.caffeine.cache.SSMSA",
-            "com.github.benmanes.caffeine.cache.SSSW",
-            "com.github.benmanes.caffeine.cache.PSAMS",
             "com.zaxxer.hikari.HikariConfig",
             "org.sqlite.JDBC",
             "org.sqlite.SQLiteConfig",
-            "org.sqlite.SQLiteConnection"
+            "org.sqlite.SQLiteConnection",
+            "org.hibernate.bytecode.internal.none.BytecodeProviderImpl"
     );
 
     public static void main(String[] args) throws IOException, ClassNotFoundException {
@@ -34,12 +31,18 @@ public class Main {
         classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.dto.emby"));
         classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.dto.tg"));
         classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.dto.pansou"));
+        classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.dto.sync"));
+        classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.dto.backup"));
+        classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.dto.diagnostics"));
+        classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.dto.playback"));
+        classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.dto.telegram"));
         classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.tvbox"));
         classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.domain"));
         classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.entity"));
         classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.model"));
         classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.storage"));
         classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.live.model"));
+        classes.addAll(findAllClassesUsingClassLoader("db.migration.current"));
         //classes.addAll(findAllClassesUsingClassLoader("cn.har01d.alist_tvbox.play.model"));
         List<Map<String, Object>> result = new ArrayList<>();
         for (Class clazz : classes) {
@@ -61,6 +64,13 @@ public class Main {
         for (String name : CUSTOM_REFLECTION_CLASSES) {
             result.add(addCustom(name));
         }
+        // caffeine 全部 BoundedLocalCache 实现类 + LocalCacheFactory:
+        // NativeCaffeineFactoryFix 启动预填 FACTORIES 注册表依赖这些类可 forName 加载
+        // (清单与修正器共用同一来源,见 NativeCaffeineFactoryFix.IMPL_CLASSES)。
+        for (String name : cn.har01d.alist_tvbox.config.NativeCaffeineFactoryFix.IMPL_CLASSES) {
+            result.add(addCustom("com.github.benmanes.caffeine.cache." + name));
+        }
+        result.add(addCustom("com.github.benmanes.caffeine.cache.LocalCacheFactory"));
         ObjectMapper objectMapper = new ObjectMapper();
         String json = objectMapper.writeValueAsString(result);
         System.out.println("Working Directory = " + System.getProperty("user.dir"));

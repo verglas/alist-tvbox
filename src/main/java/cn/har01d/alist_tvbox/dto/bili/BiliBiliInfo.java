@@ -29,6 +29,9 @@ public class BiliBiliInfo {
     private List<User> staff;
     //private SubtitleList subtitle;
     private List<PageInfo> pages;
+    /** UP 主合集(view 接口随视频详情同包返回,零额外请求) */
+    @JsonProperty("ugc_season")
+    private UgcSeason ugcSeason;
 
     @Data
     public static class Stats {
@@ -53,6 +56,43 @@ public class BiliBiliInfo {
         private long duration;
         private int page;
         private String part;
+    }
+
+    @Data
+    public static class UgcSeason {
+        private long id;
+        private String title;
+        private String cover;
+        private long mid;
+        private List<Section> sections = new ArrayList<>();
+
+        @Data
+        public static class Section {
+            private long id;
+            private String title;
+            private List<Episode> episodes = new ArrayList<>();
+        }
+
+        @Data
+        public static class Episode {
+            private long aid;
+            private String bvid;
+            private long cid;
+            private String title;
+            private Arc arc;
+            /** 成员视频的分P全集(各P独立 cid):ugc_season 载荷自带,合集线多P展开零额外请求 */
+            private List<PageInfo> pages = new ArrayList<>();
+
+            /** 条目时长(秒):实测响应无顶层 duration 字段,取 arc.duration(与视频条目 duration 同口径) */
+            public long getDuration() {
+                return arc == null ? 0 : arc.getDuration();
+            }
+        }
+
+        @Data
+        public static class Arc {
+            private long duration;
+        }
     }
 
     @Data

@@ -9,7 +9,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -21,6 +21,7 @@ import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.Map;
+import java.time.Duration;
 
 @Slf4j
 @Component
@@ -44,7 +45,7 @@ public class GuangyapanOfflineDownloadHandler implements OfflineDownloadHandler 
                                             RestTemplateBuilder builder,
                                             ObjectMapper objectMapper) {
         this.driverAccountRepository = driverAccountRepository;
-        this.restTemplate = builder.build();
+        this.restTemplate = builder.connectTimeout(Duration.ofSeconds(10)).readTimeout(Duration.ofSeconds(30)).build();
         this.objectMapper = objectMapper;
     }
 
@@ -77,16 +78,20 @@ public class GuangyapanOfflineDownloadHandler implements OfflineDownloadHandler 
     }
 
     private String findFolder(DriverAccount account, String parentId, String name) {
-        ObjectNode listBody = objectMapper.createObjectNode();
-        listBody.put("parentId", parentId);
-        listBody.put("page", 0);
-        listBody.put("pageSize", 100);
-        listBody.put("orderBy", 0);
-        listBody.put("sortType", 0);
-        ObjectNode list = exchangeWithRetry(account, FILE_LIST_URL, HttpMethod.POST, listBody);
-        log.info("findFolder response for parentId={}: {}", parentId, list);
-        ArrayNode items = withArray(list, "data", "list");
-        if (items != null) {
+        // 单页 100 条:目录超 100 时找不到会重复建 offline 目录 —— 翻页找,页未满即止(上限 10 页)
+        for (int page = 0; page < 10; page++) {
+            ObjectNode listBody = objectMapper.createObjectNode();
+            listBody.put("parentId", parentId);
+            listBody.put("page", page);
+            listBody.put("pageSize", 100);
+            listBody.put("orderBy", 0);
+            listBody.put("sortType", 0);
+            ObjectNode list = exchangeWithRetry(account, FILE_LIST_URL, HttpMethod.POST, listBody);
+            log.debug("findFolder response for parentId={} page={}", parentId, page);
+            ArrayNode items = withArray(list, "data", "list");
+            if (items == null || items.isEmpty()) {
+                return "";
+            }
             for (var item : items) {
                 if (name.equals(item.path("fileName").asText("")) && item.path("resType").asInt(0) != 1) {
                     String id = item.path("fileId").asText("");
@@ -95,12 +100,20 @@ public class GuangyapanOfflineDownloadHandler implements OfflineDownloadHandler 
                     }
                 }
             }
+            if (items.size() < 100) {
+                return "";
+            }
         }
         return "";
     }
 
     @Override
     public TaskResult submitAndWait(DriverAccount account, String url, String folderId) {
+        return submitAndWait(account, url, folderId, 30);
+    }
+
+    @Override
+    public TaskResult submitAndWait(DriverAccount account, String url, String folderId, int waitSeconds) {
         log.info("submitting guangyapan offline download: accountId={}, folderId={}", account.getId(), folderId);
 
         ObjectNode createBody = objectMapper.createObjectNode();
@@ -115,13 +128,21 @@ public class GuangyapanOfflineDownloadHandler implements OfflineDownloadHandler 
         }
         log.info("guangyapan task created: taskId={}", taskId);
 
-        for (int i = 0; i < 30; i++) {
-            ObjectNode taskListBody = objectMapper.createObjectNode();
-            taskListBody.put("pageSize", 100);
-            taskListBody.putArray("status").add(0).add(1).add(2).add(5);
-            ObjectNode taskList = exchangeWithRetry(account, LIST_TASK_URL, HttpMethod.POST, taskListBody);
-
-            ObjectNode task = findTaskInList(taskList, taskId);
+        for (int i = 0; i < Math.max(1, waitSeconds); i++) {
+            // 任务超 100 条时单页找不到会白轮询到超时(任务明明已完成)—— 翻页找,页未满即止
+            ObjectNode task = null;
+            for (int page = 0; page < 5 && task == null; page++) {
+                ObjectNode taskListBody = objectMapper.createObjectNode();
+                taskListBody.put("page", page);
+                taskListBody.put("pageSize", 100);
+                taskListBody.putArray("status").add(0).add(1).add(2).add(5);
+                ObjectNode taskList = exchangeWithRetry(account, LIST_TASK_URL, HttpMethod.POST, taskListBody);
+                task = findTaskInList(taskList, taskId);
+                ArrayNode pageItems = withArray(taskList, "data", "list");
+                if (pageItems == null || pageItems.size() < 100) {
+                    break;
+                }
+            }
             if (task != null) {
                 int status = task.path("status").asInt(-1);
                 if (status == 2) {
@@ -146,7 +167,7 @@ public class GuangyapanOfflineDownloadHandler implements OfflineDownloadHandler 
             sleepOneSecond();
         }
 
-        throw new BadRequestException("光鸭云盘离线下载任务未在30秒内完成");
+        throw new BadRequestException("光鸭云盘离线下载任务未在" + Math.max(1, waitSeconds) + "秒内完成");
     }
 
     @Override

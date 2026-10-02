@@ -1,6 +1,10 @@
 package cn.har01d.alist_tvbox.web;
 
 import cn.har01d.alist_tvbox.dto.FilterDto;
+import cn.har01d.alist_tvbox.dto.bili.BiliActionRequest;
+import cn.har01d.alist_tvbox.dto.bili.BiliCommentActionRequest;
+import cn.har01d.alist_tvbox.dto.bili.BiliCommentReplyRequest;
+import cn.har01d.alist_tvbox.dto.bili.BiliDanmakuPostRequest;
 import cn.har01d.alist_tvbox.dto.bili.CookieData;
 import cn.har01d.alist_tvbox.dto.bili.QrCode;
 import cn.har01d.alist_tvbox.service.BiliBiliService;
@@ -38,23 +42,27 @@ public class BiliBiliController {
     public Object api(String t, String ids, String wd,
                       boolean quick,
                       FilterDto filter,
+                      @RequestParam(name = "client", required = false) String clientParam,
                       @RequestParam(required = false, defaultValue = "1") Integer pg,
                       HttpServletRequest request,
                       HttpServletResponse response) throws IOException {
-        return api("", t, ids, wd, quick, filter, pg, request, response);
+        return api("", t, ids, wd, quick, filter, clientParam, pg, request, response);
     }
 
     @GetMapping("/bilibili/{token}")
     public Object api(@PathVariable String token, String t, String ids, String wd,
                       boolean quick,
                       FilterDto filter,
+                      @RequestParam(name = "client", required = false) String clientParam,
                       @RequestParam(required = false, defaultValue = "1") Integer pg,
                       HttpServletRequest request,
                       HttpServletResponse response) throws IOException {
         subscriptionService.checkToken(token);
         response.setContentType("application/json");
 
-        String client = request.getHeader("X-CLIENT");
+        // 会话键优先取配置下发时烤进 URL 的一次性设备标识(?client=,共享 token 部署按下载隔离翻页会话),
+        // 老配置无该参数回落 X-CLIENT 头,再回落共享桶 —— 各端 B站翻页游标从此按设备分桶
+        String client = clientParam != null && !clientParam.isBlank() ? clientParam : request.getHeader("X-CLIENT");
         log.info("path: {}  folder: {}  keyword: {}  filter: {}  quick: {} page: {}", ids, t, wd, filter, quick, pg);
         Object result;
         if (ids != null && !ids.isEmpty()) {
@@ -64,13 +72,62 @@ public class BiliBiliController {
                 result = biliBiliService.getDetail(ids, client);
             }
         } else if (t != null && !t.isEmpty()) {
-            result = biliBiliService.getMovieList(t, filter, pg);
+            result = biliBiliService.getMovieList(t, filter, pg, client);
         } else if (wd != null && !wd.isEmpty()) {
-            result = biliBiliService.search(wd, filter.getSort(), filter.getDuration(), 0, quick);
+            result = biliBiliService.search(wd, filter.getSort(), filter.getDuration(), 0, quick, client);
         } else {
-            result = biliBiliService.getCategoryList();
+            result = biliBiliService.getCategoryList(client);
         }
         return result;
+    }
+
+    @PostMapping({"/bilibili/action", "/bilibili/{token}/action"})
+    public Object action(@PathVariable(required = false) String token,
+                         @RequestBody BiliActionRequest request) {
+        subscriptionService.checkToken(token);
+        log.info("bilibili action: {} {}", request.id(), request.action());
+        return biliBiliService.runAction(request.id(), request.action());
+    }
+
+    /** atv-player 评论列表:root 空=主列表(mode 3=热门/2=最新,next=游标),root 非空=楼中楼(pn 翻页)。 */
+    @GetMapping("/bilibili/{token}/comments")
+    public Object comments(@PathVariable String token,
+                           String ids,
+                           @RequestParam(required = false, defaultValue = "3") Integer mode,
+                           String next,
+                           String root,
+                           @RequestParam(required = false, defaultValue = "1") Integer pn) {
+        subscriptionService.checkToken(token);
+        log.info("bilibili comments: {} mode: {} root: {} pn: {}", ids, mode, root, pn);
+        return biliBiliService.getComments(ids, mode, next, root, pn);
+    }
+
+    /** atv-player 评论点赞:action 1=赞/0=取消。 */
+    @PostMapping("/bilibili/{token}/comment-action")
+    public Object commentAction(@PathVariable String token,
+                                @RequestBody BiliCommentActionRequest request) {
+        subscriptionService.checkToken(token);
+        log.info("bilibili comment action: {} {} {}", request.id(), request.rpid(), request.action());
+        return biliBiliService.runCommentAction(request.id(), request.rpid(), request.action());
+    }
+
+    /** atv-player 回复评论:返回上游新评论对象供客户端本地插入。 */
+    @PostMapping("/bilibili/{token}/comment-reply")
+    public Object commentReply(@PathVariable String token,
+                               @RequestBody BiliCommentReplyRequest request) {
+        subscriptionService.checkToken(token);
+        log.info("bilibili comment reply: {} root: {} parent: {}", request.id(), request.root(), request.parent());
+        return biliBiliService.runCommentReply(request.id(), request.root(), request.parent(), request.message());
+    }
+
+    /** atv-player 发送弹幕(x/v2/dm/post,WBI 签名+csrf):返回 dmid。 */
+    @PostMapping("/bilibili/{token}/danmaku-post")
+    public Object danmakuPost(@PathVariable String token,
+                              @RequestBody BiliDanmakuPostRequest request) {
+        subscriptionService.checkToken(token);
+        log.info("bilibili danmaku post: {} mode: {} progress: {}", request.id(), request.mode(), request.progress());
+        return biliBiliService.postDanmaku(request.id(), request.message(), request.progress(),
+                request.mode(), request.color(), request.fontsize());
     }
 
     @GetMapping("/api/bilibili/status")

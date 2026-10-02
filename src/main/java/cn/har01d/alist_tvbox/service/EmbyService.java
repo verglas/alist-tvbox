@@ -35,7 +35,7 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -123,7 +123,7 @@ public class EmbyService {
         int i = 1;
         List<Emby> list = embyRepository.findAll();
         for (Emby emby : list) {
-            emby.setOrder(i++);
+            emby.setSortOrder(i++);
         }
         embyRepository.saveAll(list);
         settingRepository.save(new Setting("fix_emby_order", "true"));
@@ -157,7 +157,7 @@ public class EmbyService {
 
     public List<Emby> findAll() {
         List<Emby> list = new ArrayList<>(embyRepository.findAll());
-        list.sort(Comparator.comparing(Emby::getOrder));
+        list.sort(Comparator.comparing(Emby::getSortOrder));
         return list;
     }
 
@@ -354,7 +354,7 @@ public class EmbyService {
         int id = proxyService.generateImageUrl(url, referer);
         // nginx https
         return ServletUriComponentsBuilder.fromCurrentRequest()
-                .scheme(appProperties.isEnableHttps() && !Utils.isLocalAddress() ? "https" : "http") // nginx https
+                .scheme(Utils.publicScheme(appProperties.isEnableHttps())) // nginx https
                 .replacePath("/images/" + id)
                 .replaceQuery("")
                 .build()
@@ -394,8 +394,25 @@ public class EmbyService {
         try {
             HttpHeaders headers = setHeaders(emby, info);
             HttpEntity<Object> entity = new HttpEntity<>(null, headers);
-            String url = emby.getUrl() + "/emby/Users/" + info.getUser().getId() + "/Items?IncludePeople=false&IncludeMedia=true&IncludeGenres=false&IncludeStudios=false&IncludeArtists=false&IncludeItemTypes=" + type + "&Limit=30&Fields=PrimaryImageAspectRatio,BasicSyncInfo,ProductionYear,CommunityRating&Recursive=true&EnableTotalRecordCount=false&ImageTypeLimit=1&searchTerm=" + wd;
-            var response = restTemplate.exchange(url, HttpMethod.GET, entity, EmbyItems.class).getBody();
+            // official parameter name is SearchTerm; some proxied sites bind query names case-sensitively
+            // and silently drop the lower-case searchTerm form
+            var uri = UriComponentsBuilder.fromUriString(emby.getUrl() + "/emby/Users/" + info.getUser().getId() + "/Items")
+                    .queryParam("IncludePeople", "false")
+                    .queryParam("IncludeMedia", "true")
+                    .queryParam("IncludeGenres", "false")
+                    .queryParam("IncludeStudios", "false")
+                    .queryParam("IncludeArtists", "false")
+                    .queryParam("IncludeItemTypes", type)
+                    .queryParam("Limit", "30")
+                    .queryParam("Fields", "PrimaryImageAspectRatio,BasicSyncInfo,ProductionYear,CommunityRating")
+                    .queryParam("Recursive", "true")
+                    .queryParam("EnableTotalRecordCount", "false")
+                    .queryParam("ImageTypeLimit", "1")
+                    .queryParam("SearchTerm", wd)
+                    .encode()
+                    .build()
+                    .toUri();
+            var response = restTemplate.exchange(uri, HttpMethod.GET, entity, EmbyItems.class).getBody();
             for (var item : response.getItems()) {
                 var movie = getSearchDetail(item, emby);
                 list.add(movie);

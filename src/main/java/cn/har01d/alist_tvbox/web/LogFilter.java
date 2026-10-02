@@ -1,5 +1,6 @@
 package cn.har01d.alist_tvbox.web;
 
+import cn.har01d.alist_tvbox.util.Utils;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -12,6 +13,9 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
 import java.net.URLDecoder;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component
 public class LogFilter extends OncePerRequestFilter {
@@ -19,16 +23,30 @@ public class LogFilter extends OncePerRequestFilter {
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
-        String url = request.getRequestURI();
+        String url = maskPath(request.getRequestURI());
         if (!skip(request)) {
-            log.info("{} - {} {} {}", getRemoteAddr(request), request.getMethod(), url, decodeUrl(request.getQueryString()));
+            String query = decodeUrl(maskQuery(request.getQueryString()));
+            // 弹幕轮询接口每房间约 2 秒一次:降为 debug,避免 INFO 刷屏
+            if (url.startsWith("/live/danmaku")) {
+                log.debug("{} - {} {} {}", getRemoteAddr(request), request.getMethod(), url, query);
+            } else {
+                log.info("{} - {} {} {}", getRemoteAddr(request), request.getMethod(), url, query);
+            }
         }
         filterChain.doFilter(request, response);
     }
 
     private boolean skip(HttpServletRequest request) {
         String query = request.getQueryString();
-        return query != null && query.contains("log=false");
+        if (query != null && query.contains("log=false")) {
+            return true;
+        }
+        // 客户端高频轮询/上报端点:同步开启时 spider 60s、atv-player 5min 一次,
+        // 网页播放时每个进度 tick 一次;默认不记,避免 INFO 刷屏
+        String uri = request.getRequestURI();
+        return uri.equals("/api/playback/events")
+                || uri.equals("/api/playback/event")
+                || uri.equals("/api/playback/changes");
     }
 
     private String getRemoteAddr(HttpServletRequest req) {
@@ -39,6 +57,51 @@ public class LogFilter extends OncePerRequestFilter {
             return req.getHeader("X-FORWARDED-FOR");
         }
         return req.getRemoteAddr();
+    }
+
+    private static final Set<String> SENSITIVE_PARAMS = Set.of(
+            "x-access-token", "token", "access_token", "refresh_token",
+            "password", "passwd", "secret", "api_key", "apikey", "cookie", "sign");
+
+    /** 鉴权全靠 path 末段 secret 的 GET 端点(/ali/token/{secret} 等):不脱敏则 secret 原样进访问日志/反代日志/浏览器历史。 */
+    private static final Pattern SECRET_PATH = Pattern.compile(
+            "^(/(?:ali/(?:token|open)|(?:quark|uc|115|baidu)/cookie|cookies)/)(.+)$");
+
+    private String maskPath(String uri) {
+        if (uri == null) {
+            return null;
+        }
+        Matcher m = SECRET_PATH.matcher(uri);
+        if (m.matches()) {
+            return m.group(1) + "***";
+        }
+        return uri;
+    }
+
+    /** 对 query 中敏感参数(token/密码/签名等)的值脱敏(基于原始编码串拆分,避免解码后 & = 歧义)。 */
+    private String maskQuery(String query) {
+        if (StringUtils.isBlank(query)) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String pair : query.split("&")) {
+            if (sb.length() > 0) {
+                sb.append("&");
+            }
+            int eq = pair.indexOf('=');
+            if (eq < 0) {
+                sb.append(pair);
+                continue;
+            }
+            String name = pair.substring(0, eq);
+            String value = pair.substring(eq + 1);
+            if (SENSITIVE_PARAMS.contains(name.toLowerCase())) {
+                sb.append(name).append("=").append(Utils.mask(value));
+            } else {
+                sb.append(pair);
+            }
+        }
+        return sb.toString();
     }
 
     private String decodeUrl(String text) {

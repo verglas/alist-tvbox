@@ -9,7 +9,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -25,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.time.Duration;
 
 @Slf4j
 @Component
@@ -32,6 +33,7 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
     private static final String SPACE_URL = "https://115.com/?ct=clouddownload&ac=space";
     private static final String ADD_TASK_URL = "https://clouddownload.115.com/web/?ac=add_task_urls";
     private static final String QUOTA_URL = "https://clouddownload.115.com/web/?ac=get_quota_package_info&uid=%s";
+    private static final String TASK_DEL_URL = "https://lixian.115.com/lixian/?ct=lixian&ac=task_del";
     private static final int TASK_LIST_PAGE_SIZE = 1000;
     private static final String FILE_LIST_URL = "https://webapi.115.com/files?aid=1&cid=%s&offset=0&limit=20&type=0&show_dir=1&fc_mix=0&natsort=1&count_folders=1&format=json&custom_order=0";
     private static final String FILE_ADD_URL = "https://webapi.115.com/files/add";
@@ -41,13 +43,23 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
     private final ObjectMapper objectMapper;
 
     public Pan115OfflineDownloadHandler(RestTemplateBuilder builder, ObjectMapper objectMapper) {
-        this.restTemplate = builder.build();
+        this.restTemplate = builder.connectTimeout(Duration.ofSeconds(10)).readTimeout(Duration.ofSeconds(30)).build();
         this.objectMapper = objectMapper;
     }
 
     @Override
     public DriverType getDriverType() {
         return DriverType.PAN115;
+    }
+
+    @Override
+    public boolean supportsTaskManagement() {
+        return true;
+    }
+
+    @Override
+    public boolean deletesFilesWithTask() {
+        return true; // task_del flag=1 任务+文件一次原子删
     }
 
     @Override
@@ -78,6 +90,11 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
 
     @Override
     public TaskResult submitAndWait(DriverAccount account, String url, String folderId) {
+        return submitAndWait(account, url, folderId, 10);
+    }
+
+    @Override
+    public TaskResult submitAndWait(DriverAccount account, String url, String folderId, int waitSeconds) {
         String cookie = requireCookie(account);
         String uid = extractUid(cookie);
 
@@ -108,7 +125,7 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
             throw new BadRequestException("task failed: " + message);
         }
 
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < Math.max(1, waitSeconds); i++) {
             ObjectNode task = findTask(url, cookie, duplicateTask ? 2 : 1);
             if (task == null) {
                 sleepOneSecond();
@@ -134,7 +151,7 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
             sleepOneSecond();
         }
 
-        throw new BadRequestException("离线下载任务未在10秒内完成");
+        throw new BadRequestException("离线下载任务未在" + Math.max(1, waitSeconds) + "秒内完成");
     }
 
     @Override
@@ -144,6 +161,59 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
         ObjectNode quota = exchange(String.format(QUOTA_URL, uid), HttpMethod.POST, cookie, "https://115.com/", "");
         return new QuotaResult(true,
                 String.format("本月配额：剩%d/总%d个", quota.path("surplus").asInt(0), quota.path("count").asInt(0)));
+    }
+
+    /** 离线清理活体检查:任务列表按 info_hash(缺失按产物名)对账。契约与 add/task_lists 同 web 会话。 */
+    @Override
+    public TaskStatus taskStatus(DriverAccount account, String infoHash, String taskName) {
+        ObjectNode task = findTaskByIdentity(account, infoHash, taskName, 2);
+        if (task == null) {
+            return TaskStatus.ABSENT;
+        }
+        int status = task.path("status").asInt(-1);
+        if (status == 2) {
+            return TaskStatus.SUCCEEDED;
+        }
+        if (status == -1 || status == 4) {
+            return TaskStatus.FAILED;
+        }
+        return TaskStatus.RUNNING;
+    }
+
+    /**
+     * 删除 115 离线任务(115driver offline.go DeleteOfflineTasks 契约:form 重复 hash + flag,
+     * 0=仅任务/1=任务+文件)。info_hash 缺失先按产物名从任务列表解析;任务列表查无 = 任务不存在,
+     * 幂等成功。task_del 报错时回查一次任务列表,确实已不存在同样视为成功。
+     */
+    @Override
+    public void deleteTask(DriverAccount account, String infoHash, String taskName, boolean deleteFiles) {
+        String cookie = requireCookie(account);
+        String hash = infoHash;
+        if (StringUtils.isBlank(hash)) {
+            ObjectNode task = findTaskByIdentity(account, null, taskName, 2);
+            if (task == null) {
+                log.info("115 offline task not found by name {}, nothing to delete", taskName);
+                return;
+            }
+            hash = task.path("info_hash").asText("");
+        }
+        if (StringUtils.isBlank(hash)) {
+            throw new BadRequestException("无法定位115离线任务(缺少info_hash)");
+        }
+        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
+        form.add("hash", hash);
+        form.add("flag", deleteFiles ? "1" : "0");
+        try {
+            ObjectNode result = exchange(TASK_DEL_URL, HttpMethod.POST, cookie, "https://115.com/", encodeForm(form));
+            ensureState(result, "删除115离线下载任务失败");
+        } catch (BadRequestException e) {
+            if (findTaskByIdentity(account, hash, taskName, 2) == null) {
+                log.info("115 offline task {} already gone, treat delete as success", hash);
+                return; // 删失败但任务确实不在了:幂等成功
+            }
+            throw e;
+        }
+        log.info("115 offline task {} deleted (deleteFiles={})", hash, deleteFiles);
     }
 
     private String requireCookie(DriverAccount account) {
@@ -220,6 +290,10 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
         form.add("url[0]", url);
         form.add("savepath", "");
         form.add("wp_path_id", pathId);
+        return encodeForm(form);
+    }
+
+    private static String encodeForm(MultiValueMap<String, String> form) {
         return form.entrySet().stream()
                 .flatMap(entry -> entry.getValue().stream()
                         .map(value -> encode(entry.getKey()) + "=" + encode(value)))
@@ -227,7 +301,7 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
                 .orElse("");
     }
 
-    private String encode(String value) {
+    private static String encode(String value) {
         return URLEncoder.encode(value, StandardCharsets.UTF_8);
     }
 
@@ -243,13 +317,70 @@ public class Pan115OfflineDownloadHandler implements OfflineDownloadHandler {
         return null;
     }
 
-    private ObjectNode findTaskInPage(ObjectNode taskList, String url) {
+    static ObjectNode findTaskInPage(ObjectNode taskList, String url) {
         if (!taskList.has("tasks") || !taskList.get("tasks").isArray()) {
             return null;
         }
+        String infoHash = extractInfoHash(url);
         for (var item : taskList.get("tasks")) {
+            String taskHash = item.path("info_hash").asText("");
+            if (StringUtils.isNotBlank(infoHash)
+                    && StringUtils.isNotBlank(taskHash)
+                    && taskHash.equalsIgnoreCase(infoHash)) {
+                return (ObjectNode) item;
+            }
             if (Objects.equals(item.path("url").asText(""), url)) {
                 return (ObjectNode) item;
+            }
+        }
+        return null;
+    }
+
+    static String extractInfoHash(String url) {
+        return OfflineDownloadHandler.extractInfoHash(url);
+    }
+
+    /** 删任务前解析产物名(超时 PENDING 行 taskName=null,兜底删文件需要路径)。 */
+    @Override
+    public String resolveTaskName(DriverAccount account, String infoHash, String taskName) {
+        ObjectNode task = findTaskByIdentity(account, infoHash, taskName, 2);
+        if (task == null) {
+            return taskName;
+        }
+        return StringUtils.firstNonBlank(task.path("name").asText(""), taskName);
+    }
+
+    /** 离线清理对账:任务列表按 info_hash 优先/产物名兜底定位任务。 */
+    private ObjectNode findTaskByIdentity(DriverAccount account, String infoHash, String taskName, int pages) {
+        String cookie = requireCookie(account);
+        for (int page = 1; page <= pages; page++) {
+            ObjectNode taskList = exchange(taskListUrl(page), HttpMethod.POST, cookie, "https://115.com/", "");
+            ensureState(taskList, "查询115离线下载任务失败");
+            ObjectNode task = findTaskByIdentityInPage(taskList, infoHash, taskName);
+            if (task != null) {
+                return task;
+            }
+        }
+        return null;
+    }
+
+    static ObjectNode findTaskByIdentityInPage(ObjectNode taskList, String infoHash, String taskName) {
+        if (!taskList.has("tasks") || !taskList.get("tasks").isArray()) {
+            return null;
+        }
+        if (StringUtils.isNotBlank(infoHash)) {
+            for (var item : taskList.get("tasks")) {
+                String taskHash = item.path("info_hash").asText("");
+                if (StringUtils.isNotBlank(taskHash) && taskHash.equalsIgnoreCase(infoHash)) {
+                    return (ObjectNode) item;
+                }
+            }
+        }
+        if (StringUtils.isNotBlank(taskName)) {
+            for (var item : taskList.get("tasks")) {
+                if (taskName.equals(item.path("name").asText(""))) {
+                    return (ObjectNode) item;
+                }
             }
         }
         return null;

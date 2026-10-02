@@ -11,7 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.SimpleTransactionStatus;
@@ -47,6 +47,8 @@ class PluginServiceTest {
     private PlatformTransactionManager transactionManager;
     @Mock
     private SubscriptionSourceService subscriptionSourceService;
+    @Mock
+    private GitHubProxyService gitHubProxyService;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -57,7 +59,8 @@ class PluginServiceTest {
         when(builder.build()).thenReturn(restTemplate);
         lenient().when(transactionManager.getTransaction(any(TransactionDefinition.class))).thenReturn(new SimpleTransactionStatus());
         lenient().when(subscriptionSourceService.nextSortOrder()).thenReturn(1);
-        pluginService = new PluginService(pluginRepository, settingRepository, builder, objectMapper, new TransactionTemplate(transactionManager), subscriptionSourceService);
+        lenient().when(gitHubProxyService.readProxyListFromFile()).thenReturn(List.of());
+        pluginService = new PluginService(pluginRepository, settingRepository, builder, objectMapper, new TransactionTemplate(transactionManager), subscriptionSourceService, gitHubProxyService);
     }
 
     @Test
@@ -88,6 +91,27 @@ class PluginServiceTest {
         assertThat(saved.getSortOrder()).isEqualTo(1);
         assertThat(saved.getLastError()).isBlank();
         assertThat(saved.getLastCheckedAt()).isNotNull();
+    }
+
+    @Test
+    void createShouldStoreRawPythonContentAndClassifyUrlPathWithQuery() {
+        String url = "https://example.com/plugins/Demo.PY?raw=1";
+        String stableId = "02544b320a6d45de997bc0bd3975d0c060b8";
+        String content = "PLUGIN_ID = \"" + stableId + "\"\nclass Spider:\n    pass\n";
+        Plugin plugin = new Plugin();
+        plugin.setUrl(url);
+
+        when(pluginRepository.findByUrl(url)).thenReturn(Optional.empty());
+        when(pluginRepository.findByExternalId(stableId)).thenReturn(Optional.empty());
+        when(restTemplate.getForObject(URI.create(url), String.class)).thenReturn(content);
+        when(pluginRepository.save(any(Plugin.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        Plugin saved = pluginService.create(plugin);
+
+        assertThat(PluginService.isPythonPluginUrl(url)).isTrue();
+        assertThat(saved.getName()).isEqualTo("Demo");
+        assertThat(saved.getExternalId()).isEqualTo(stableId);
+        assertThat(saved.getContent()).isEqualTo(content);
     }
 
     @Test
@@ -144,6 +168,39 @@ class PluginServiceTest {
 
         assertThat(refreshed.getContent()).isEqualTo("stable-body");
         assertThat(refreshed.getLastError()).contains("插件地址不可访问");
+    }
+
+    @Test
+    void refreshShouldReplaceRawPythonContent() {
+        Plugin plugin = new Plugin();
+        plugin.setId(21);
+        plugin.setName("Demo");
+        plugin.setSourceName("Demo");
+        plugin.setUrl("https://example.com/plugins/demo.py");
+        plugin.setContent("old");
+
+        when(pluginRepository.findById(21)).thenReturn(Optional.of(plugin));
+        when(restTemplate.getForObject(URI.create(plugin.getUrl()), String.class)).thenReturn("new");
+        when(pluginRepository.save(any(Plugin.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        Plugin refreshed = pluginService.refresh(21);
+
+        assertThat(PluginService.isPythonPluginUrl(plugin.getUrl())).isTrue();
+        assertThat(refreshed.getContent()).isEqualTo("new");
+    }
+
+    @Test
+    void deriveSourceNameShouldIgnoreQueryDots() {
+        assertThat(pluginService.deriveSourceName(
+                "https://example.com/plugins/demo.py?download=release.v1#source"))
+                .isEqualTo("demo");
+    }
+
+    @Test
+    void pythonPluginClassifierShouldRejectTxtAndInvalidUrls() {
+        assertThat(PluginService.isPythonPluginUrl("https://example.com/demo.txt")).isFalse();
+        assertThat(PluginService.isPythonPluginUrl("not a url")).isFalse();
+        assertThat(PluginService.isPythonPluginUrl(null)).isFalse();
     }
 
     @Test
@@ -324,6 +381,22 @@ class PluginServiceTest {
         PluginService.ImportResult result = pluginService.importFromSource(repositoryUrl);
 
         assertThat(result.sourceUrl()).isEqualTo(resolvedUrl);
+        assertThat(result.created()).containsExactly("demo");
+    }
+
+    @Test
+    void importFromSourceShouldAcceptChineseCharactersInUrl() {
+        String sourceUrl = "https://example.com/我的仓库/spiders_v2.json";
+        String encodedSourceUrl = "https://example.com/%E6%88%91%E7%9A%84%E4%BB%93%E5%BA%93/spiders_v2.json";
+        String pluginUrl = "https://example.com/demo.txt";
+
+        when(restTemplate.getForObject(URI.create(encodedSourceUrl), String.class)).thenReturn("[\"" + pluginUrl + "\"]");
+        when(pluginRepository.findByUrl(pluginUrl)).thenReturn(Optional.empty());
+        when(restTemplate.getForObject(URI.create(pluginUrl), String.class)).thenReturn("body");
+        when(pluginRepository.save(any(Plugin.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        PluginService.ImportResult result = pluginService.importFromSource(sourceUrl);
+
         assertThat(result.created()).containsExactly("demo");
     }
 
@@ -531,6 +604,35 @@ class PluginServiceTest {
     }
 
     @Test
+    void importShouldRefreshWhenSameVersionChangesBetweenTxtAndPython() {
+        String sourceUrl = "https://github.com/har01d5/tvbox/raw/refs/heads/master/spiders_v2.json";
+        String oldPluginUrl = "https://github.com/har01d5/tvbox/raw/refs/heads/master/py/demo.txt";
+        String newPluginUrl = "https://github.com/har01d5/tvbox/raw/refs/heads/master/py/demo.py";
+        String externalId = "demo-id";
+        String payload = "[{\"id\":\"" + externalId + "\",\"version\":1,\"file\":\"py/demo.py\"}]";
+        Plugin existing = new Plugin();
+        existing.setId(12);
+        existing.setName("demo");
+        existing.setSourceName("demo");
+        existing.setExternalId(externalId);
+        existing.setUrl(oldPluginUrl);
+        existing.setVersion(1);
+        existing.setContent("encrypted-text");
+
+        when(restTemplate.getForObject(URI.create(sourceUrl), String.class)).thenReturn(payload);
+        when(pluginRepository.findByExternalId(externalId)).thenReturn(Optional.of(existing));
+        when(restTemplate.getForObject(URI.create(newPluginUrl), String.class)).thenReturn("class Spider: pass");
+        when(pluginRepository.findById(12)).thenReturn(Optional.of(existing));
+        when(pluginRepository.save(any(Plugin.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        PluginService.ImportResult result = pluginService.importFromSource(sourceUrl);
+
+        assertThat(result.refreshed()).containsExactly("demo");
+        assertThat(existing.getUrl()).isEqualTo(newPluginUrl);
+        assertThat(existing.getContent()).isEqualTo("class Spider: pass");
+    }
+
+    @Test
     void importFromObjectSpidersJsonShouldBackfillExternalIdWhenVersionMatchesExistingUrl() {
         String sourceUrl = "https://github.com/har01d5/tvbox/raw/refs/heads/master/spiders_v2.json";
         String pluginUrl = "https://github.com/har01d5/tvbox/raw/refs/heads/master/py/relative.txt";
@@ -601,5 +703,39 @@ class PluginServiceTest {
         assertThat(result.failed().getFirst()).contains(pluginUrl);
         assertThat(existing.getContent()).isEqualTo("stable");
         assertThat(existing.getLastError()).contains("插件地址不可访问");
+    }
+
+    @Test
+    void upsertWebPageInsertsNewRowAtFrontOfPlugins() {
+        when(pluginRepository.findByUrl("/static/webhome/pages/emby.html")).thenReturn(Optional.empty());
+        when(pluginRepository.save(any(Plugin.class))).thenAnswer(invocation -> {
+            Plugin saved = invocation.getArgument(0);
+            if (saved.getId() == null) {
+                saved.setId(5);
+            }
+            return saved;
+        });
+
+        Plugin result = pluginService.upsertWebPage("/static/webhome/pages/emby.html", "emby");
+
+        assertThat(result.getUrl()).isEqualTo("/static/webhome/pages/emby.html");
+        assertThat(result.getName()).isEqualTo("emby");
+        // 新建落插件区最前(内置源之后、其它插件之前),不沉底
+        verify(subscriptionSourceService).moveToFrontOfPlugins("plugin-5");
+    }
+
+    @Test
+    void upsertWebPageRescanKeepsPosition() {
+        Plugin existing = new Plugin();
+        existing.setId(5);
+        existing.setUrl("/static/webhome/pages/emby.html");
+        existing.setName("emby");
+        when(pluginRepository.findByUrl("/static/webhome/pages/emby.html")).thenReturn(Optional.of(existing));
+        when(pluginRepository.save(existing)).thenReturn(existing);
+
+        pluginService.upsertWebPage("/static/webhome/pages/emby.html", "emby");
+
+        // 重扫只刷新检查时间,不重排用户调过的顺序
+        verify(subscriptionSourceService, never()).moveToFrontOfPlugins(org.mockito.ArgumentMatchers.anyString());
     }
 }

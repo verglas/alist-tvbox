@@ -26,7 +26,7 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -466,7 +466,7 @@ public class JellyfinService {
 
     public List<Jellyfin> findAll() {
         List<Jellyfin> list = new ArrayList<>(jellyfinRepository.findAll());
-        list.sort(Comparator.comparing(Jellyfin::getOrder));
+        list.sort(Comparator.comparing(Jellyfin::getSortOrder));
         return list;
     }
 
@@ -862,7 +862,8 @@ public class JellyfinService {
         List<String> urls = new ArrayList<>();
         for (var source : media.getItems()) {
             urls.add(source.getName());
-            urls.add(jellyfin.getUrl() + "/Videos/" + parts[1] + "/stream.mp4?Static=true&mediaSourceId=" + parts[1] + "&deviceId=" + info.getSessionInfo().getDeviceId() + "&api_key=" + info.getAccessToken() + "&Tag=" + source.getEtag());
+            // Jellyfin 12 禁用 legacy 认证后小写 api_key 查询参数返回 401，ApiKey 是新旧版本都认的参数名
+            urls.add(jellyfin.getUrl() + "/Videos/" + parts[1] + "/stream.mp4?Static=true&mediaSourceId=" + parts[1] + "&deviceId=" + info.getSessionInfo().getDeviceId() + "&ApiKey=" + info.getAccessToken() + "&Tag=" + source.getEtag());
         }
         String ua = Constants.JELLYFIN_USER_AGENT;
         if (StringUtils.isNotBlank(jellyfin.getUserAgent())) {

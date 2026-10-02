@@ -16,7 +16,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
@@ -86,16 +86,22 @@ public class CcService implements LivePlatform {
         CategoryList result = new CategoryList();
         List<Category> list = new ArrayList<>();
 
-        String url = "https://api.cc.163.com/v1/wapcc/gamecategory?catetype=0";
-        var response = restTemplate.getForObject(url, CcCategoryResponse.class);
+        // wapcc 分类接口存在地区性迁移风险(pure_live 实证 cc.163.com 系老 JSON 端点部分区域已 302 到
+        // ds.163.com HTML 应用),失败时返回空分类导航而非 NPE 炸 500,搜索/详情仍可用
+        try {
+            String url = "https://api.cc.163.com/v1/wapcc/gamecategory?catetype=0";
+            var response = restTemplate.getForObject(url, CcCategoryResponse.class);
 
-        for (var item : response.getData().getCategory_info().getGame_list()) {
-            Category category = new Category();
-            category.setType_id(getType() + "-" + item.getGametype());
-            category.setType_name(item.getName());
-            category.setType_flag(0);
-            category.setCover(item.getCover());
-            list.add(category);
+            for (var item : response.getData().getCategory_info().getGame_list()) {
+                Category category = new Category();
+                category.setType_id(getType() + "-" + item.getGametype());
+                category.setType_name(item.getName());
+                category.setType_flag(0);
+                category.setCover(item.getCover());
+                list.add(category);
+            }
+        } catch (Exception e) {
+            log.warn("网易CC分类获取失败: {}", e.getMessage());
         }
 
         result.setCategories(list);
@@ -110,11 +116,13 @@ public class CcService implements LivePlatform {
     public MovieList list(String id, String ac, String sort, Integer pg) throws IOException {
         String[] parts = id.split("-");
         String gid = parts[1];
+        int page = pg == null || pg < 1 ? 1 : pg;
 
         MovieList result = new MovieList();
         List<MovieDetail> list = new ArrayList<>();
 
-        String url = "https://cc.163.com/api/category/" + gid + "/?format=json&tag_id=0&start=0&size=120";
+        // 公共 feed 接口按 start 偏移翻页(pure_live 06f92b44 同款);此前 start 恒 0,TVBox 翻页全是重复内容
+        String url = "https://cc.163.com/api/category/" + gid + "/?format=json&tag_id=0&start=" + (page - 1) * 120 + "&size=120";
         var response = restTemplate.getForObject(url, CcRoomList.class);
         for (var room : response.getLives()) {
             MovieDetail detail = new MovieDetail();
@@ -227,7 +235,7 @@ public class CcService implements LivePlatform {
         }
         // nginx https
         return ServletUriComponentsBuilder.fromCurrentRequest()
-                .scheme(appProperties.isEnableHttps() && !Utils.isLocalAddress() ? "https" : "http") // nginx https
+                .scheme(Utils.publicScheme(appProperties.isEnableHttps())) // nginx https
                 .replacePath("/images")
                 .replaceQuery("url=" + url)
                 .build()

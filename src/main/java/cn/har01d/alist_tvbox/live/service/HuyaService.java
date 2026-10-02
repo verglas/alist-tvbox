@@ -1,5 +1,6 @@
 package cn.har01d.alist_tvbox.live.service;
 
+import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.config.AppProperties;
 import cn.har01d.alist_tvbox.live.model.HuyaCategoryList;
 import cn.har01d.alist_tvbox.live.model.HuyaLiveRoom;
@@ -12,17 +13,17 @@ import cn.har01d.alist_tvbox.tvbox.MovieDetail;
 import cn.har01d.alist_tvbox.tvbox.MovieList;
 import cn.har01d.alist_tvbox.util.Constants;
 import cn.har01d.alist_tvbox.util.Utils;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -36,6 +37,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.zip.GZIPInputStream;
 
 @Slf4j
 @Service
@@ -68,6 +70,11 @@ public class HuyaService implements LivePlatform {
     public String getType() {
         return "huya";
     }
+    /** 流地址经 /p 通用代理中转。 */
+    @Override
+    public boolean isProxied() {
+        return true;
+    }
 
     @Override
     public String getName() {
@@ -75,11 +82,11 @@ public class HuyaService implements LivePlatform {
     }
 
     @Override
-    public MovieList home() throws JsonProcessingException {
+    public MovieList home() throws IOException {
         MovieList result = new MovieList();
         List<MovieDetail> list = new ArrayList<>();
         String url = "https://www.huya.com/cache.php?m=LiveList&do=getLiveListByPage&tagAll=0";
-        var json = restTemplate.getForObject(url, String.class);
+        var json = httpGet(url);
         log.trace("home json: {}", json);
         var response = objectMapper.readValue(json, HuyaLiveRoomInfoListResponse.class);
         for (var room : response.getData().getDatas()) {
@@ -104,7 +111,7 @@ public class HuyaService implements LivePlatform {
         CategoryList result = new CategoryList();
         List<Category> list = new ArrayList<>();
 
-        var json = restTemplate.getForObject("https://m.huya.com/cache.php?m=Game&do=ajaxGameList&bussType=", String.class);
+        var json = httpGet("https://m.huya.com/cache.php?m=Game&do=ajaxGameList&bussType=");
         log.trace("category json: {}", json);
         var huyaCategoryList = objectMapper.readValue(json, HuyaCategoryList.class);
         for (var item : huyaCategoryList.getGameList()) {
@@ -133,7 +140,7 @@ public class HuyaService implements LivePlatform {
         List<MovieDetail> list = new ArrayList<>();
 
         String url = "https://www.huya.com/cache.php?m=LiveList&do=getLiveListByPage&gameId=" + gid + "&tagAll=0&page=" + pg;
-        var json = restTemplate.getForObject(url, String.class);
+        var json = httpGet(url);
         log.trace("list json: {}", json);
         var response = objectMapper.readValue(json.replaceAll("\\p{Cntrl}", ""), HuyaLiveRoomInfoListResponse.class);
         for (var room : response.getData().getDatas()) {
@@ -184,13 +191,30 @@ public class HuyaService implements LivePlatform {
         return result;
     }
 
+    /**
+     * 获取主播 yyuid(弹幕进房参数),来自 mp.huya.com 的 profileRoom 接口 data.profileInfo.uid。
+     */
+    public long getAyyuid(String roomId) {
+        try {
+            String url = "https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid=" + roomId + "&showSecret=1";
+            JsonNode root = objectMapper.readTree(httpGet(url));
+            return root.path("data").path("profileInfo").path("uid").asLong(0);
+        } catch (Exception e) {
+            log.warn("虎牙获取yyuid失败,roomId:[{}]", roomId, e);
+            return 0;
+        }
+    }
+
     @Override
     public MovieList detail(String tid, String client) throws IOException {
         String[] parts = tid.split("\\$");
+        if (parts.length < 2) {
+            throw new BadRequestException("无效的直播间ID: " + tid);
+        }
         String id = parts[1];
         MovieList result = new MovieList();
         String url = "https://m.huya.com/" + id;
-        var response = restTemplate.getForObject(url, String.class);
+        var response = httpGet(url);
         Matcher matcherOwnerName = OwnerName.matcher(response);
         Matcher matcherRoomName = RoomName.matcher(response);
         Matcher matcherRoomPic = RoomPic.matcher(response);
@@ -233,7 +257,7 @@ public class HuyaService implements LivePlatform {
     private String buildProxyUrl(String url) {
         String p = "/p/" + subscriptionService.getCurrentToken() + "/0@" + proxyService.generateProxyUrl(url);
         return ServletUriComponentsBuilder.fromCurrentRequest()
-                .scheme(appProperties.isEnableHttps() && !Utils.isLocalAddress() ? "https" : "http") // nginx https
+                .scheme(Utils.publicScheme(appProperties.isEnableHttps())) // nginx https
                 .replacePath(p)
                 .replaceQuery("")
                 .build()
@@ -241,11 +265,17 @@ public class HuyaService implements LivePlatform {
     }
 
     private void parseUrls(MovieDetail movieDetail, String html, String client) throws IOException {
-        int start = html.indexOf("window.HNF_GLOBAL_INIT = ") + 25;
+        int marker = html.indexOf("window.HNF_GLOBAL_INIT = ");
+        if (marker < 0) {
+            // indexOf==-1 时 +25 得 24,start>0 恒真,垃圾子串进 Jackson 直接抛 —— 标记缺失按无流处理
+            log.debug("HNF_GLOBAL_INIT marker missing, no stream info");
+            return;
+        }
+        int start = marker + 25;
         int end = html.indexOf("</script>", start);
         List<String> playFrom = new ArrayList<>();
         List<String> playUrl = new ArrayList<>();
-        if (start > 0 && end > start) {
+        if (end > start) {
             String uid = getUid(13, 10);
             String json = html.substring(start, end);
             start = json.indexOf("vBitRateInfo");
@@ -254,7 +284,7 @@ public class HuyaService implements LivePlatform {
             log.trace("vBitRateInfo: {}", "{" + json.substring(start, end) + "}");
             HuyaLiveRoom.BitRateInfoList vBitRateInfo = objectMapper.readValue("{" + json.substring(start, end) + "}", HuyaLiveRoom.BitRateInfoList.class);
 
-            JsonNode streams = objectMapper.readTree(json).get("roomInfo").get("tLiveInfo").get("tLiveStreamInfo").get("vStreamInfo").get("value");
+            JsonNode streams = objectMapper.readTree(json).path("roomInfo").path("tLiveInfo").path("tLiveStreamInfo").path("vStreamInfo").path("value");
             int i = 1;
             for (JsonNode stream : streams) {
                 String cdn = stream.get("sCdnType").asText();
@@ -283,6 +313,20 @@ public class HuyaService implements LivePlatform {
         }
         movieDetail.setVod_play_from(String.join("$$$", playFrom));
         movieDetail.setVod_play_url(String.join("$$$", playUrl));
+    }
+
+    // 虎牙部分 CDN 边缘节点会无视 Accept-Encoding 直接返回 gzip 响应，HttpURLConnection 不会自动解压
+    private String httpGet(String url) throws IOException {
+        byte[] body = restTemplate.getForObject(url, byte[].class);
+        if (body == null || body.length == 0) {
+            return "";
+        }
+        if (body.length > 2 && body[0] == 0x1f && body[1] == (byte) 0x8b) {
+            try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(body))) {
+                body = gis.readAllBytes();
+            }
+        }
+        return new String(body, StandardCharsets.UTF_8);
     }
 
     private List<String> findAll(String text, Pattern pattern) {

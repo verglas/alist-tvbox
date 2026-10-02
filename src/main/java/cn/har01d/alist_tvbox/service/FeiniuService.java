@@ -68,7 +68,7 @@ public class FeiniuService {
 
     public List<Feiniu> findAll() {
         List<Feiniu> list = new ArrayList<>(feiniuRepository.findAll());
-        list.sort(Comparator.comparing(item -> Objects.requireNonNullElse(item.getOrder(), 0)));
+        list.sort(Comparator.comparing(item -> Objects.requireNonNullElse(item.getSortOrder(), 0)));
         return list;
     }
 
@@ -334,8 +334,17 @@ public class FeiniuService {
         Feiniu site = getById(siteId);
         String token = tokenForProxy(site);
         String targetUrl = path.startsWith("http://") || path.startsWith("https://") ? path : site.getUrl() + path;
+        // path 客户端可控:绝对 URL 指向其它主机时把 Authorization/Trim-MC-token 一并发过去 = 凭证转发,只放行站点本域
+        String siteHost = URI.create(site.getUrl()).getHost();
+        String targetHost = URI.create(targetUrl).getHost();
+        if (siteHost == null || targetHost == null || !siteHost.equalsIgnoreCase(targetHost)) {
+            throw new BadRequestException("飞牛代理目标超出站点域名: " + targetUrl);
+        }
 
         HttpURLConnection connection = (HttpURLConnection) new URL(targetUrl).openConnection();
+        // 慢对端不设超时会挂死请求线程
+        connection.setConnectTimeout(10_000);
+        connection.setReadTimeout(60_000);
         connection.setRequestMethod(request.getMethod());
         connection.setRequestProperty("Authorization", token);
         connection.setRequestProperty("Cookie", "mode=relay; Trim-MC-token=" + token);
@@ -760,7 +769,7 @@ public class FeiniuService {
     }
 
     private String buildProxyUrl(String baseUrl, String token, int siteId, String path) {
-        return UriComponentsBuilder.fromHttpUrl(baseUrl)
+        return UriComponentsBuilder.fromUriString(baseUrl)
                 .path("/feiniu-proxy/{token}")
                 .queryParam("site", siteId)
                 .queryParam("path", URLEncoder.encode(path, StandardCharsets.UTF_8).replace("+", "%20"))
@@ -841,7 +850,7 @@ public class FeiniuService {
 
     private String buildImageProxyUrl(String baseUrl, String token, int siteId, String path) {
         if (path.startsWith("http://") || path.startsWith("https://")) {
-            return UriComponentsBuilder.fromHttpUrl(baseUrl)
+            return UriComponentsBuilder.fromUriString(baseUrl)
                     .path("/feiniu-img/{token}")
                     .queryParam("site", siteId)
                     .queryParam("path", path)
@@ -852,7 +861,7 @@ public class FeiniuService {
         if (!path.startsWith("/")) {
             path = "/" + path;
         }
-        return UriComponentsBuilder.fromHttpUrl(baseUrl)
+        return UriComponentsBuilder.fromUriString(baseUrl)
                 .path("/feiniu-img/{token}")
                 .queryParam("site", siteId)
                 .queryParam("path", path)

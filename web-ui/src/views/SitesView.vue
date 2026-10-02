@@ -1,13 +1,16 @@
 <template>
-  <div class="sites">
-    <h1>AList站点列表</h1>
-    <el-row justify="end">
-      <el-button @click="load">刷新</el-button>
-      <el-button type="primary" @click="handleAdd">添加</el-button>
-    </el-row>
-    <div class="space"></div>
+  <div class="page-container">
+    <div class="page-header">
+      <h1 class="page-title">AList站点列表</h1>
+      <div class="page-actions">
+        <el-button @click="load">刷新</el-button>
+        <el-button type="primary" @click="handleAdd">添加</el-button>
+      </div>
+    </div>
 
-    <el-table :data="sites" border style="width: 100%">
+    <div class="page-card">
+      <div class="table-scroll-wrapper">
+        <el-table :data="sites" border style="width: 100%; min-width: 1000px">
 <!--      <el-table-column prop="id" label="ID" sortable width="70"/>-->
       <el-table-column prop="name" label="名称" sortable width="180"/>
       <el-table-column prop="url" label="URL地址" sortable>
@@ -48,7 +51,7 @@
           </el-icon>
         </template>
       </el-table-column>
-      <el-table-column fixed="right" label="操作" width="200">
+      <el-table-column fixed="right" label="操作" width="260">
         <template #default="scope">
           <el-button link type="primary" size="small" @click="handleEdit(scope.row)">编辑</el-button>
           <el-button link type="primary" size="small" @click="showDetails(scope.row)">数据</el-button>
@@ -57,6 +60,8 @@
         </template>
       </el-table-column>
     </el-table>
+    </div>
+    </div>
 
     <el-dialog v-model="formVisible" :title="dialogTitle">
       <el-form :model="form">
@@ -67,7 +72,7 @@
           <el-input v-model="form.url" autocomplete="off"/>
         </el-form-item>
         <el-form-item label="版本" label-width="140">
-          <el-input-number v-model="form.version" min="2" autocomplete="off"/>
+          <el-input-number v-model="form.version" min="1" autocomplete="off"/>
         </el-form-item>
         <el-form-item label="根目录" label-width="140">
           <el-input v-model="form.folder" :readonly="form.id===1" autocomplete="off"/>
@@ -209,15 +214,9 @@
     </el-dialog>
   </div>
 
-  <div class="divider"></div>
-
   <EmbyView></EmbyView>
 
-  <div class="divider"></div>
-
   <JellyfinView></JellyfinView>
-
-  <div class="divider"></div>
 
   <FeiniuView></FeiniuView>
 
@@ -261,6 +260,7 @@ const total = ref(0)
 const jsonData = ref({} as VodList)
 const paths = ref([] as Item[])
 const sites = ref([])
+const has115Account = ref(true)
 const siteVisible = ref(false)
 const formVisible = ref(false)
 const dialogVisible = ref(false)
@@ -385,7 +385,8 @@ const updateIndexFile = (id: string | number) => {
 
 const load = () => {
   axios.get('/api/sites').then(({data}) => {
-    sites.value = data
+    // 115分享索引站点(version 1)没有 115 账号时整体不可用,站点列表隐藏
+    sites.value = has115Account.value ? data : data.filter((s: any) => s.version !== 1)
   })
 }
 
@@ -472,7 +473,9 @@ const handleExceed: UploadProps['onExceed'] = (files: File[]) => {
 }
 
 onMounted(async () => {
-  load()
+  axios.get('/api/index115/status').then(({data}) => {
+    has115Account.value = data.hasAccount
+  }).finally(load)
   if (!store.token) {
     store.token = await axios.get("/api/token").then(({data}) => {
       return data.token ? data.token.split(",")[0] : "-"

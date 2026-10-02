@@ -3,6 +3,7 @@ package cn.har01d.alist_tvbox.web;
 import cn.har01d.alist_tvbox.dto.OpenApiDto;
 import cn.har01d.alist_tvbox.dto.ShareLink;
 import cn.har01d.alist_tvbox.dto.SharesDto;
+import cn.har01d.alist_tvbox.dto.StorageReloadProgress;
 import cn.har01d.alist_tvbox.entity.Share;
 import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.model.Response;
@@ -34,7 +35,7 @@ public class ShareController {
     }
 
     @GetMapping("/api/shares")
-    public Page<Share> list(Pageable pageable, Integer type, String keyword) {
+    public Page<Share> list(Pageable pageable, String type, String keyword) {
         return shareService.list(pageable, type, keyword);
     }
 
@@ -59,7 +60,7 @@ public class ShareController {
     }
 
     @DeleteMapping("/api/shares")
-    public int deleteShares(Integer type) {
+    public int deleteShares(String type) {
         return shareService.deleteShares(type);
     }
 
@@ -118,13 +119,28 @@ public class ShareController {
         return shareService.reloadStorage(id);
     }
 
+    @PostMapping("/api/storages/reload-all")
+    public StorageReloadProgress reloadAllStorages(@RequestParam(defaultValue = "2000") long interval) {
+        return shareService.startReloadAllStorages(interval);
+    }
+
+    @GetMapping("/api/storages/reload-all")
+    public StorageReloadProgress getReloadAllProgress() {
+        return shareService.getReloadAllProgress();
+    }
+
+    @PostMapping("/api/storages/reload-all/cancel")
+    public StorageReloadProgress cancelReloadAllStorages() {
+        return shareService.cancelReloadAllStorages();
+    }
+
     @PostMapping("/api/import-shares")
     public int importShares(@RequestBody SharesDto sharesDto) {
         return shareService.importShares(sharesDto);
     }
 
     @PostMapping("/api/import-share-file")
-    public int importShares(@RequestParam("file") MultipartFile file, int type, int delay) throws IOException {
+    public int importShares(@RequestParam("file") MultipartFile file, String type, int delay) throws IOException {
         if (file.isEmpty()) {
             throw new BadRequestException();
         }
@@ -138,7 +154,7 @@ public class ShareController {
     }
 
     @GetMapping("/api/export-shares")
-    public String exportShare(HttpServletResponse response, int type) {
+    public String exportShare(HttpServletResponse response, String type) {
         return shareService.exportShare(response, type);
     }
 
